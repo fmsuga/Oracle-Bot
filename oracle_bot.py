@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
-║           ORACLE BOT v2 — Market Scanner             ║
-║  Escanea top 30 USDT por volumen cada ciclo          ║
-║  Análisis: RSI · MA · Bollinger · MACD · Momentum    ║
+║           ORACLE BOT v3 — Market Scanner             ║
+║  Multi-timeframe · BTC filter · File logging         ║
 ╚══════════════════════════════════════════════════════╝
 """
 
 import time
-import requests
+import logging
+import os
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 
 # ───────────────────────────────────────────────────────
@@ -19,10 +21,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class Config:
 
-    # ── Universo de mercado ────────────────────────────
+    # ── Universo ───────────────────────────────────────
     TOP_N_PAIRS       = 30
     MIN_VOLUME_USD    = 5_000_000
-
     EXCLUDE = {
         "USDCUSDT","BUSDUSDT","TUSDUSDT","USDTUSDT",
         "FDUSDUSDT","DAIUSDT","EURUSDT","PAXUSDT",
@@ -37,34 +38,63 @@ class Config:
     TAKE_PROFIT_PCT   = 5.0
 
     # ── Señal ──────────────────────────────────────────
-    MIN_SCORE         = 3
+    # Score mínimo requerido en CADA timeframe para operar
+    MIN_SCORE_1H      = 3    # sobre 8
+    MIN_SCORE_4H      = 2    # sobre 8 (menos exigente en TF mayor)
+
+    # ── Filtro BTC ─────────────────────────────────────
+    BTC_FILTER        = True   # False = deshabilitar
+    # Si RSI de BTC en 4h < este valor → bloquear compras
+    BTC_RSI_BLOCK_BUY = 40
+    # Si RSI de BTC en 4h > este valor → bloquear ventas en largo
+    BTC_RSI_BLOCK_SELL = 65
+    # Si BTC cae más de este % en 4h → bloquear compras
+    BTC_DROP_BLOCK    = -3.0
+
+    # ── Timing ─────────────────────────────────────────
     SCAN_INTERVAL     = 60
     ANALYSIS_INTERVAL = 300
 
-    # ── API ────────────────────────────────────────────
+    # ── API / sistema ──────────────────────────────────
     BINANCE           = "https://api.binance.com"
     THREADS           = 8
+    LOG_DIR           = "logs"
 
 
 # ───────────────────────────────────────────────────────
-#  LOGGER
+#  LOGGER — consola con color + archivo diario
 # ───────────────────────────────────────────────────────
 
 COLORS = {
-    "BUY":   "\033[92m",
-    "SELL":  "\033[91m",
-    "TRADE": "\033[93m",
-    "SCAN":  "\033[96m",
-    "BOT":   "\033[94m",
-    "DATA":  "\033[90m",
-    "SCORE": "\033[95m",
+    "BUY":    "\033[92m",
+    "SELL":   "\033[91m",
+    "TRADE":  "\033[93m",
+    "SCAN":   "\033[96m",
+    "BOT":    "\033[94m",
+    "DATA":   "\033[90m",
+    "SCORE":  "\033[95m",
+    "FILTER": "\033[33m",
+    "MTF":    "\033[36m",
 }
 RESET = "\033[0m"
 
-def log(tag, msg):
+os.makedirs(Config.LOG_DIR, exist_ok=True)
+_log_filename = os.path.join(
+    Config.LOG_DIR,
+    f"oracle_{datetime.now().strftime('%Y-%m-%d')}.log"
+)
+logging.basicConfig(
+    filename=_log_filename,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+def log(tag: str, msg: str):
     ts  = datetime.now().strftime("%H:%M:%S")
     col = COLORS.get(tag, "")
-    print(f"{ts} {col}[{tag:6s}]{RESET} {msg}")
+    print(f"{ts} {col}[{tag:7s}]{RESET} {msg}")
+    logging.info(f"[{tag}] {msg}")
 
 
 # ───────────────────────────────────────────────────────
@@ -82,7 +112,7 @@ class BinanceClient:
             r = self._session.get(
                 f"{self.base}{path}",
                 params=params,
-                timeout=8
+                timeout=8,
             )
             r.raise_for_status()
             return r.json()
@@ -97,29 +127,23 @@ class BinanceClient:
                 {"symbol": s, "volume": 0, "change_pct": 0, "price": 0}
                 for s in ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
             ]
-
-        usdt_pairs = []
+        pairs = []
         for t in data:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
-                continue
-            if sym in Config.EXCLUDE:
+            if not sym.endswith("USDT") or sym in Config.EXCLUDE:
                 continue
             vol = float(t.get("quoteVolume", 0))
             if vol < Config.MIN_VOLUME_USD:
                 continue
-            usdt_pairs.append({
+            pairs.append({
                 "symbol":     sym,
                 "volume":     vol,
                 "change_pct": float(t.get("priceChangePercent", 0)),
                 "price":      float(t.get("lastPrice", 0)),
             })
-
-        usdt_pairs.sort(key=lambda x: x["volume"], reverse=True)
-        top = usdt_pairs[:Config.TOP_N_PAIRS]
-
-        log("SCAN", f"Universo: {len(top)} pares  "
-                    f"(vol min ${Config.MIN_VOLUME_USD/1e6:.0f}M)")
+        pairs.sort(key=lambda x: x["volume"], reverse=True)
+        top = pairs[:Config.TOP_N_PAIRS]
+        log("SCAN", f"Universo: {len(top)} pares  (vol min ${Config.MIN_VOLUME_USD/1e6:.0f}M)")
         return top
 
     def get_price(self, symbol):
@@ -128,9 +152,7 @@ class BinanceClient:
 
     def get_klines(self, symbol, interval="1h", limit=100):
         data = self._get("/api/v3/klines", {
-            "symbol":   symbol,
-            "interval": interval,
-            "limit":    limit,
+            "symbol": symbol, "interval": interval, "limit": limit,
         })
         return data if data else []
 
@@ -142,40 +164,33 @@ class BinanceClient:
 class TA:
 
     @staticmethod
-    def compute(klines, current_price):
+    def compute(klines, current_price=None):
         if len(klines) < 50:
             return {}
-
         closes = [float(k[4]) for k in klines]
         highs  = [float(k[2]) for k in klines]
         lows   = [float(k[3]) for k in klines]
         vols   = [float(k[5]) for k in klines]
-
-        closes[-1] = current_price
-
-        rsi  = TA.rsi(closes)
-        ma7  = TA.ma(closes, 7)
-        ma21 = TA.ma(closes, 21)
-        ma50 = TA.ma(closes, 50)
-        bb   = TA.bollinger(closes)
-        macd = TA.macd_calc(closes)
-        mom  = TA.momentum(closes)
+        if current_price:
+            closes[-1] = current_price
 
         vol_avg   = sum(vols[-20:]) / 20
         vol_ratio = vols[-1] / vol_avg if vol_avg > 0 else 1
 
         return {
-            "price":     current_price,
-            "rsi":       rsi,
-            "ma7":       ma7,
-            "ma21":      ma21,
-            "ma50":      ma50,
-            "bb":        bb,
-            "macd":      macd,
-            "momentum":  mom,
+            "price":     closes[-1],
+            "rsi":       TA.rsi(closes),
+            "ma7":       TA.ma(closes, 7),
+            "ma21":      TA.ma(closes, 21),
+            "ma50":      TA.ma(closes, 50),
+            "bb":        TA.bollinger(closes),
+            "macd":      TA.macd_calc(closes),
+            "momentum":  TA.momentum(closes),
             "vol_ratio": vol_ratio,
             "high_24h":  max(highs[-24:]),
             "low_24h":   min(lows[-24:]),
+            # Cambio % en este timeframe (últimas 4 velas)
+            "change_4c": (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0,
         }
 
     @staticmethod
@@ -191,8 +206,8 @@ class TA:
         al = losses / period
         for i in range(period + 1, len(prices)):
             d = prices[i] - prices[i-1]
-            ag = (ag * (period-1) + (d if d > 0 else 0)) / period
-            al = (al * (period-1) + (abs(d) if d < 0 else 0)) / period
+            ag = (ag*(period-1) + (d if d > 0 else 0)) / period
+            al = (al*(period-1) + (abs(d) if d < 0 else 0)) / period
         if al == 0:
             return 100
         return 100 - 100 / (1 + ag/al)
@@ -209,41 +224,29 @@ class TA:
             return None
         s    = prices[-period:]
         mean = sum(s) / period
-        std  = (sum((x - mean)**2 for x in s) / period) ** 0.5
-        return {
-            "upper": mean + 2*std,
-            "mid":   mean,
-            "lower": mean - 2*std,
-        }
+        std  = (sum((x-mean)**2 for x in s) / period) ** 0.5
+        return {"upper": mean + 2*std, "mid": mean, "lower": mean - 2*std}
 
     @staticmethod
     def macd_calc(prices, fast=12, slow=26, signal=9):
         if len(prices) < slow + signal + 5:
             return None
         def ema(p, n):
-            k = 2/(n+1)
-            e = p[0]
-            for v in p[1:]:
-                e = v*k + e*(1-k)
+            k = 2/(n+1); e = p[0]
+            for v in p[1:]: e = v*k + e*(1-k)
             return e
         try:
             macd_vals = []
             for i in range(slow, len(prices)):
-                win = prices[max(0, i - slow*2): i+1]
-                m   = ema(win[-fast:], fast) - ema(win, slow)
-                macd_vals.append(m)
+                win = prices[max(0, i-slow*2): i+1]
+                macd_vals.append(ema(win[-fast:], fast) - ema(win, slow))
             if len(macd_vals) < signal + 2:
                 return None
             sig_line  = ema(macd_vals[-signal*2:], signal)
             hist      = macd_vals[-1] - sig_line
-            prev_sig  = ema(macd_vals[-signal*2-1:-1], signal)
-            prev_hist = macd_vals[-2] - prev_sig
-            if hist > 0 and prev_hist <= 0:
-                cross = "bullish"
-            elif hist < 0 and prev_hist >= 0:
-                cross = "bearish"
-            else:
-                cross = "none"
+            prev_hist = macd_vals[-2] - ema(macd_vals[-signal*2-1:-1], signal)
+            cross = ("bullish" if hist > 0 and prev_hist <= 0 else
+                     "bearish" if hist < 0 and prev_hist >= 0 else "none")
             return {"hist": hist, "cross": cross}
         except Exception:
             return None
@@ -262,7 +265,8 @@ class TA:
 class StrategyEngine:
 
     @staticmethod
-    def score(ta):
+    def score(ta: dict) -> dict:
+        """Score -8 a +8. Cada indicador vota con peso propio."""
         if not ta:
             return {"score": 0, "signals": [], "action": "HOLD", "vol_note": ""}
 
@@ -270,101 +274,193 @@ class StrategyEngine:
         signals = []
         price   = ta.get("price", 0)
 
-        # RSI (peso ±2)
+        # RSI (±2)
         rsi = ta.get("rsi")
         if rsi is not None:
-            if rsi < 25:
-                score += 2
-                signals.append(f"RSI {rsi:.0f} sobreventa extrema")
-            elif rsi < 35:
-                score += 1
-                signals.append(f"RSI {rsi:.0f} sobreventa")
-            elif rsi > 75:
-                score -= 2
-                signals.append(f"RSI {rsi:.0f} sobrecompra extrema")
-            elif rsi > 65:
-                score -= 1
-                signals.append(f"RSI {rsi:.0f} sobrecompra")
+            if   rsi < 25: score += 2; signals.append(f"RSI {rsi:.0f} sobreventa extrema")
+            elif rsi < 35: score += 1; signals.append(f"RSI {rsi:.0f} sobreventa")
+            elif rsi > 75: score -= 2; signals.append(f"RSI {rsi:.0f} sobrecompra extrema")
+            elif rsi > 65: score -= 1; signals.append(f"RSI {rsi:.0f} sobrecompra")
 
-        # Tendencia MA (peso ±2)
-        ma7  = ta.get("ma7")
-        ma21 = ta.get("ma21")
-        ma50 = ta.get("ma50")
+        # Tendencia MA (±2)
+        ma7, ma21, ma50 = ta.get("ma7"), ta.get("ma21"), ta.get("ma50")
         if ma7 and ma21 and ma50:
-            if ma7 > ma21 > ma50:
-                score += 2
-                signals.append("Tendencia alcista MA7>MA21>MA50")
-            elif ma7 < ma21 < ma50:
-                score -= 2
-                signals.append("Tendencia bajista MA7<MA21<MA50")
-            elif ma7 > ma21:
-                score += 1
-                signals.append("MA7 cruza MA21 al alza")
-            elif ma7 < ma21:
-                score -= 1
-                signals.append("MA7 cruza MA21 a la baja")
+            if   ma7 > ma21 > ma50: score += 2; signals.append("Tendencia alcista MA7>MA21>MA50")
+            elif ma7 < ma21 < ma50: score -= 2; signals.append("Tendencia bajista MA7<MA21<MA50")
+            elif ma7 > ma21:        score += 1; signals.append("MA7 sobre MA21")
+            elif ma7 < ma21:        score -= 1; signals.append("MA7 bajo MA21")
 
-        # Bollinger (peso ±2)
+        # Bollinger (±2)
         bb = ta.get("bb")
         if bb and price:
             rng = bb["upper"] - bb["lower"]
             if rng > 0:
                 pct = (price - bb["lower"]) / rng
-                if pct < 0.05:
-                    score += 2
-                    signals.append("Bajo banda inferior BB")
-                elif pct < 0.2:
-                    score += 1
-                    signals.append("Zona baja BB")
-                elif pct > 0.95:
-                    score -= 2
-                    signals.append("Sobre banda superior BB")
-                elif pct > 0.8:
-                    score -= 1
-                    signals.append("Zona alta BB")
+                if   pct < 0.05: score += 2; signals.append("Bajo banda inferior BB")
+                elif pct < 0.20: score += 1; signals.append("Zona baja BB")
+                elif pct > 0.95: score -= 2; signals.append("Sobre banda superior BB")
+                elif pct > 0.80: score -= 1; signals.append("Zona alta BB")
 
-        # MACD (peso ±1)
+        # MACD (±1)
         macd = ta.get("macd")
         if macd:
-            if macd["cross"] == "bullish":
-                score += 1
-                signals.append("MACD cruce alcista")
-            elif macd["cross"] == "bearish":
-                score -= 1
-                signals.append("MACD cruce bajista")
+            if   macd["cross"] == "bullish": score += 1; signals.append("MACD cruce alcista")
+            elif macd["cross"] == "bearish": score -= 1; signals.append("MACD cruce bajista")
 
-        # Momentum ROC (peso ±1)
+        # Momentum ROC (±1)
         mom = ta.get("momentum")
         if mom is not None:
-            if mom > 3:
-                score += 1
-                signals.append(f"Momentum +{mom:.1f}%")
-            elif mom < -3:
-                score -= 1
-                signals.append(f"Momentum {mom:.1f}%")
+            if   mom >  3: score += 1; signals.append(f"Momentum +{mom:.1f}%")
+            elif mom < -3: score -= 1; signals.append(f"Momentum {mom:.1f}%")
 
-        # Volumen (info, no vota)
+        # Volumen — informativo
         vol = ta.get("vol_ratio", 1)
-        if vol > 1.5:
-            vol_note = f"Vol x{vol:.1f} alto (confirma)"
-        elif vol < 0.5:
-            vol_note = f"Vol x{vol:.1f} bajo (señal débil)"
-        else:
-            vol_note = f"Vol x{vol:.1f} normal"
+        vol_note = (f"Vol x{vol:.1f} alto (confirma)" if vol > 1.5 else
+                    f"Vol x{vol:.1f} bajo (señal débil)" if vol < 0.5 else
+                    f"Vol x{vol:.1f} normal")
 
-        # Decisión
-        if score >= Config.MIN_SCORE:
-            action = "BUY"
-        elif score <= -Config.MIN_SCORE:
-            action = "SELL"
+        action = ("BUY"  if score >= Config.MIN_SCORE_1H else
+                  "SELL" if score <= -Config.MIN_SCORE_1H else "HOLD")
+
+        return {"score": score, "action": action, "signals": signals, "vol_note": vol_note}
+
+
+# ───────────────────────────────────────────────────────
+#  BTC MARKET FILTER
+# ───────────────────────────────────────────────────────
+
+class BTCFilter:
+    """
+    Analiza BTC en 4h y devuelve el estado del mercado.
+    block_buy  = True → no abrir compras
+    block_sell = True → no cerrar posiciones largas por señal
+    """
+
+    def __init__(self, binance: BinanceClient):
+        self.binance = binance
+        self.state   = {"block_buy": False, "block_sell": False, "reason": "OK", "rsi": None}
+
+    def update(self):
+        if not Config.BTC_FILTER:
+            return
+
+        klines = self.binance.get_klines("BTCUSDT", "4h", 60)
+        if len(klines) < 50:
+            return
+
+        ta = TA.compute(klines)
+        rsi     = ta.get("rsi")
+        change  = ta.get("change_4c", 0)   # cambio últimas 4 velas de 4h = 16h
+        ma7     = ta.get("ma7")
+        ma21    = ta.get("ma21")
+
+        block_buy  = False
+        block_sell = False
+        reasons    = []
+
+        if rsi is not None:
+            if rsi < Config.BTC_RSI_BLOCK_BUY:
+                block_buy = True
+                reasons.append(f"BTC RSI {rsi:.0f} (débil)")
+            if rsi > Config.BTC_RSI_BLOCK_SELL:
+                block_sell = True
+                reasons.append(f"BTC RSI {rsi:.0f} (sobrecomprado)")
+
+        if change < Config.BTC_DROP_BLOCK:
+            block_buy = True
+            reasons.append(f"BTC cayó {change:.1f}% en 16h")
+
+        if ma7 and ma21 and ma7 < ma21 * 0.995:
+            block_buy = True
+            reasons.append("BTC tendencia bajista 4h")
+
+        reason = " | ".join(reasons) if reasons else "Mercado OK"
+        self.state = {
+            "block_buy":  block_buy,
+            "block_sell": block_sell,
+            "reason":     reason,
+            "rsi":        rsi,
+            "change_4c":  change,
+        }
+
+        if block_buy or block_sell:
+            log("FILTER", f"BTC filter activo → {reason}")
         else:
-            action = "HOLD"
+            log("FILTER", f"BTC OK — RSI {rsi:.0f} | cambio 16h {change:+.1f}%")
+
+    @property
+    def block_buy(self):
+        return self.state.get("block_buy", False)
+
+    @property
+    def block_sell(self):
+        return self.state.get("block_sell", False)
+
+
+# ───────────────────────────────────────────────────────
+#  MULTI-TIMEFRAME ANALYSIS
+# ───────────────────────────────────────────────────────
+
+class MTFAnalysis:
+    """
+    Analiza un par en 1h y 4h.
+    Solo genera señal si AMBOS timeframes coinciden en dirección.
+    El score final es el mínimo entre los dos (el más conservador).
+    """
+
+    def __init__(self, binance: BinanceClient):
+        self.binance = binance
+
+    def analyze(self, ticker: dict) -> dict | None:
+        symbol = ticker["symbol"]
+        price  = ticker["price"]
+
+        # ── Timeframe 1h ──────────────────────────────
+        k1h = self.binance.get_klines(symbol, "1h", 100)
+        if len(k1h) < 50:
+            return None
+        ta1h   = TA.compute(k1h, price)
+        res1h  = StrategyEngine.score(ta1h)
+
+        # ── Timeframe 4h ──────────────────────────────
+        k4h = self.binance.get_klines(symbol, "4h", 100)
+        if len(k4h) < 50:
+            return None
+        ta4h   = TA.compute(k4h)
+        res4h  = StrategyEngine.score(ta4h)
+
+        score_1h = res1h["score"]
+        score_4h = res4h["score"]
+        act_1h   = res1h["action"]
+        act_4h   = res4h["action"]
+
+        # ── Confluencia: ambos TF deben coincidir ─────
+        if act_1h == act_4h and act_1h != "HOLD":
+            # El score definitivo es el mínimo (más conservador)
+            final_score  = min(abs(score_1h), abs(score_4h))
+            final_score *= (1 if act_1h == "BUY" else -1)
+            action       = act_1h
+            mtf_ok       = True
+        else:
+            # Sin confluencia → no operar aunque haya señal en 1h
+            final_score = score_1h  # guardar para info
+            action      = "HOLD"
+            mtf_ok      = False
+
+        signals_combined = res1h["signals"] + [f"[4h] {s}" for s in res4h["signals"]]
 
         return {
-            "score":    score,
-            "action":   action,
-            "signals":  signals,
-            "vol_note": vol_note,
+            "symbol":     symbol,
+            "price":      price,
+            "change_pct": ticker["change_pct"],
+            "volume":     ticker["volume"],
+            "score":      final_score,
+            "score_1h":   score_1h,
+            "score_4h":   score_4h,
+            "action":     action,
+            "mtf_ok":     mtf_ok,
+            "signals":    signals_combined,
+            "vol_note":   res1h["vol_note"],
         }
 
 
@@ -375,9 +471,9 @@ class StrategyEngine:
 class TradeManager:
 
     def __init__(self):
-        self.open_trades = {}
-        self.history     = []
-        self.balance     = float(Config.START_BALANCE)
+        self.open_trades: dict  = {}
+        self.history:     list  = []
+        self.balance:     float = float(Config.START_BALANCE)
 
     def can_open(self, symbol):
         return (
@@ -389,24 +485,18 @@ class TradeManager:
         stop   = price * (1 - Config.STOP_LOSS_PCT   / 100)
         target = price * (1 + Config.TAKE_PROFIT_PCT / 100)
         self.open_trades[symbol] = {
-            "entry":  price,
-            "stop":   stop,
-            "target": target,
-            "usdt":   Config.ORDER_USD,
-            "score":  score,
-            "time":   datetime.now(),
+            "entry": price, "stop": stop, "target": target,
+            "usdt": Config.ORDER_USD, "score": score,
+            "time": datetime.now(),
         }
         log("TRADE", f"OPEN  {symbol:<12} @ ${price:>12,.4f}  "
                      f"SL ${stop:,.4f}  TP ${target:,.4f}  score={score:+d}")
 
     def check_exit(self, symbol, price):
         t = self.open_trades.get(symbol)
-        if not t:
-            return None
-        if price <= t["stop"]:
-            return "STOP_LOSS"
-        if price >= t["target"]:
-            return "TAKE_PROFIT"
+        if not t: return None
+        if price <= t["stop"]:   return "STOP_LOSS"
+        if price >= t["target"]: return "TAKE_PROFIT"
         return None
 
     def close_trade(self, symbol, price, reason):
@@ -414,10 +504,8 @@ class TradeManager:
         pnl_pct = (price - t["entry"]) / t["entry"] * 100
         pnl_usd = t["usdt"] * pnl_pct / 100
         self.history.append({
-            "symbol":  symbol,
-            "pnl_usd": pnl_usd,
-            "pnl_pct": pnl_pct,
-            "reason":  reason,
+            "symbol": symbol, "pnl_usd": pnl_usd,
+            "pnl_pct": pnl_pct, "reason": reason,
         })
         self.balance += pnl_usd
         icon = "+" if pnl_usd > 0 else "-"
@@ -430,14 +518,12 @@ class TradeManager:
         pnl_pct = pnl / Config.START_BALANCE * 100
         wins    = sum(1 for t in self.history if t["pnl_usd"] > 0)
         wr      = wins / n * 100 if n else 0
-
         open_lines = ""
         for sym, t in self.open_trades.items():
             mins = int((datetime.now() - t["time"]).total_seconds() / 60)
             open_lines += f"\n      {sym:<12} entrada ${t['entry']:,.4f}  hace {mins}min"
-
         return (
-            f"\n  {'─'*56}"
+            f"\n  {'─'*60}"
             f"\n  Balance: ${self.balance:>10,.2f}   PnL {pnl:+.2f} ({pnl_pct:+.1f}%)"
             f"\n  Trades:  {n} cerrados | {len(self.open_trades)} abiertos | WR {wr:.0f}%"
             f"{open_lines}"
@@ -445,79 +531,85 @@ class TradeManager:
 
 
 # ───────────────────────────────────────────────────────
-#  ORACLE BOT v2
+#  ORACLE BOT v3
 # ───────────────────────────────────────────────────────
 
 class OracleBot:
 
     def __init__(self):
-        self.binance       = BinanceClient()
-        self.trades        = TradeManager()
-        self._cycle        = 0
+        self.binance        = BinanceClient()
+        self.trades         = TradeManager()
+        self.btc_filter     = BTCFilter(self.binance)
+        self.mtf            = MTFAnalysis(self.binance)
+        self._cycle         = 0
         self._last_analysis = 0
 
-    def _analyze_one(self, ticker):
-        symbol = ticker["symbol"]
-        price  = ticker["price"]
-        klines = self.binance.get_klines(symbol, "1h", 100)
-        if len(klines) < 50:
-            return None
-        ta     = TA.compute(klines, price)
-        result = StrategyEngine.score(ta)
-        return {
-            "symbol":     symbol,
-            "price":      price,
-            "change_pct": ticker["change_pct"],
-            "volume":     ticker["volume"],
-            **result,
-        }
-
     def _scan_market(self):
+        # 1. Actualizar filtro BTC primero
+        self.btc_filter.update()
+
         log("SCAN", "Obteniendo universo de mercado...")
         universe = self.binance.get_top_usdt_pairs()
         if not universe:
             return
 
-        log("SCAN", f"Analizando {len(universe)} pares ({Config.THREADS} hilos)...")
+        log("SCAN", f"Analizando {len(universe)} pares multi-timeframe ({Config.THREADS} hilos)...")
 
         results = []
         with ThreadPoolExecutor(max_workers=Config.THREADS) as ex:
-            futures = {ex.submit(self._analyze_one, t): t for t in universe}
+            futures = {ex.submit(self.mtf.analyze, t): t for t in universe}
             for future in as_completed(futures):
                 r = future.result()
                 if r:
                     results.append(r)
 
-        results.sort(key=lambda x: abs(x["score"]), reverse=True)
+        # Ordenar: primero los que tienen confluencia MTF, luego por score abs
+        results.sort(key=lambda x: (x["mtf_ok"], abs(x["score"])), reverse=True)
 
-        # Tabla resumen top 10
-        print(f"\n  {'─'*60}")
-        print(f"  {'SÍMBOLO':<12} {'PRECIO':>12} {'24h':>7} {'SCORE':>6}  ACCIÓN")
-        print(f"  {'─'*60}")
+        # ── Tabla top 10 ──────────────────────────────
+        print(f"\n  {'─'*72}")
+        print(f"  {'SÍMBOLO':<12} {'PRECIO':>12} {'24h':>7} {'1h':>5} {'4h':>5} {'MTF':>4}  ACCIÓN")
+        print(f"  {'─'*72}")
         for r in results[:10]:
-            col = COLORS.get(r["action"], "")
+            col     = COLORS.get(r["action"], "")
+            mtf_str = "✓" if r["mtf_ok"] else "✗"
             print(
                 f"  {r['symbol']:<12} ${r['price']:>11,.4f} "
                 f"{r['change_pct']:>+6.1f}%  "
-                f"{col}{r['score']:>+5d}  {r['action']}{RESET}"
+                f"{r['score_1h']:>+4d}  {r['score_4h']:>+4d}  "
+                f"{mtf_str}  {col}{r['action']}{RESET}"
             )
-        print(f"  {'─'*60}\n")
+        print(f"  {'─'*72}\n")
 
+        # ── Actuar ────────────────────────────────────
+        btc_blocked = self.btc_filter.block_buy
         for r in results:
-            self._act(r)
+            self._act(r, btc_blocked)
 
-    def _act(self, r):
+    def _act(self, r: dict, btc_block_buy: bool):
         symbol = r["symbol"]
         price  = r["price"]
         action = r["action"]
         score  = r["score"]
 
-        if action == "BUY" and self.trades.can_open(symbol):
-            log("SCORE", f"{symbol} {score:+d} → {' | '.join(r['signals'][:2])}")
-            self.trades.open_trade(symbol, price, score)
+        if symbol == "BTCUSDT":
+            return  # BTC se usa solo como filtro, no se tradea
+
+        if action == "BUY":
+            if btc_block_buy:
+                # Solo logueamos si había una buena señal bloqueada
+                if abs(score) >= Config.MIN_SCORE_1H:
+                    log("FILTER", f"BUY {symbol} bloqueado por filtro BTC ({self.btc_filter.state['reason']})")
+                return
+            if self.trades.can_open(symbol):
+                log("MTF", f"{symbol} confluencia 1h={r['score_1h']:+d} 4h={r['score_4h']:+d} → {r['signals'][0] if r['signals'] else ''}")
+                self.trades.open_trade(symbol, price, score)
 
         elif action == "SELL" and symbol in self.trades.open_trades:
-            log("SCORE", f"{symbol} {score:+d} → {' | '.join(r['signals'][:2])}")
+            if self.btc_filter.block_sell:
+                log("FILTER", f"SELL {symbol} bloqueado (BTC sobrecomprado — dejar correr)")
+                return
+            log("MTF", f"{symbol} confluencia SELL 1h={r['score_1h']:+d} 4h={r['score_4h']:+d}")
             self.trades.close_trade(symbol, price, "signal")
 
     def _check_sl_tp(self):
@@ -532,20 +624,22 @@ class OracleBot:
     def run(self):
         print(f"""
 \033[92m╔══════════════════════════════════════════════════════╗
-║           ORACLE BOT v2 — Market Scanner             ║
+║           ORACLE BOT v3 — Market Scanner             ║
 ╚══════════════════════════════════════════════════════╝\033[0m
   Universo:    Top {Config.TOP_N_PAIRS} pares USDT por volumen
+  Timeframes:  1h + 4h (confluencia requerida)
   Indicadores: RSI · MA7/21/50 · Bollinger · MACD · Momentum
-  Score mín:   {Config.MIN_SCORE}/8 para operar
+  Filtro BTC:  {'activado' if Config.BTC_FILTER else 'desactivado'}
+  Score mín:   {Config.MIN_SCORE_1H} en 1h  |  {Config.MIN_SCORE_4H} en 4h
   Capital/op:  ${Config.ORDER_USD}  |  Max trades: {Config.MAX_OPEN_TRADES}
   SL {Config.STOP_LOSS_PCT}%  |  TP {Config.TAKE_PROFIT_PCT}%
-  Análisis:    cada {Config.ANALYSIS_INTERVAL}s  |  SL/TP check: cada {Config.SCAN_INTERVAL}s
+  Log:         {_log_filename}
 """)
         while True:
             self._cycle += 1
             now = time.time()
 
-            print(f"\n{'═'*60}")
+            print(f"\n{'═'*62}")
             print(f"  Ciclo #{self._cycle} — {datetime.now().strftime('%d/%m %H:%M:%S')}")
             print(self.trades.status())
 
