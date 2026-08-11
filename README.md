@@ -41,4 +41,4 @@ Todo se edita directamente en `Config` al inicio de `oracle_bot.py`:
 
 ---
 
-> Experimental. Usá solo dinero que podés perder.
+> Experimental.
